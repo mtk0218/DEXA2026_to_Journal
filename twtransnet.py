@@ -7,7 +7,7 @@ class TWTransNet(nn.Module):
     def __init__(self, num_users, num_pois, embed_dim=50, num_times=24, num_now_weathers=8, 
                  num_day_weathers=4, num_month_weathers=9, dropout=0.1, gamma=1.0, 
                  use_season=True, use_gnn=True, is_baseline=False, skip_user_agg=False, skip_poi_agg=False,
-                 use_enhanced_traj=False, enhanced_traj_ratio=0.3, use_time=True, use_weather=True):
+                 use_enhanced_traj=False, enhanced_traj_k=6, use_time=True, use_weather=True, seq_len=10, dist_norm='legacy'):
         super(TWTransNet, self).__init__()
         self.num_users = num_users
         self.num_pois = num_pois
@@ -22,7 +22,10 @@ class TWTransNet(nn.Module):
         self.skip_user_agg = skip_user_agg
         self.skip_poi_agg = skip_poi_agg
         self.use_enhanced_traj = use_enhanced_traj
-        self.enhanced_traj_ratio = enhanced_traj_ratio
+        self.enhanced_traj_k = enhanced_traj_k
+        self.seq_len = seq_len
+        # POI遷移グラフ G_T の後続POI表（set_transition_neighbors で設定。state_dict には含めない）
+        self.trans_nbr_idx, self.trans_nbr_mask = None, None
 
         # 1. Embeddings
         self.user_embedding = nn.Embedding(num_users, embed_dim)
@@ -58,10 +61,16 @@ class TWTransNet(nn.Module):
         self.W_poi_agg = nn.Linear(embed_dim, embed_dim)
         self.activation = nn.ReLU()
 
+        # CAAI Eq (8): 強化軌跡グラフの近傍集約 e_li = σ(1/K Σ W1 e_l)
+        self.W_enh = nn.Linear(embed_dim, embed_dim, bias=False) if use_enhanced_traj else None
+        # 予測層の系列位置ごとの学習重み W2 ∈ R^{n}（STAN の Linear(M→1) に相当、softmax なし）。
+        # 1 初期化 = 有効位置の単純平均から学習を始める（predict 参照）
+        self.W2 = nn.Parameter(torch.ones(seq_len))
+
         # 2. Modules
         self.trans_layer = TransLayer()
         self.gnn_layer = UserGraphLayer(embed_dim)
-        self.st_attention = SpatialTemporalSelfAttention(embed_dim, dropout=dropout)
+        self.st_attention = SpatialTemporalSelfAttention(embed_dim, dropout=dropout, dist_norm=dist_norm)
 
         self.init_weights()
 
@@ -81,58 +90,6 @@ class TWTransNet(nn.Module):
         p_emb = self.poi_embedding.weight
         t_emb = self.time_embedding.weight
         w_now_emb = self.weather_now_embedding.weight
-
-        if self.use_enhanced_traj and 'prev_poi_idxs' in edges:
-            if self.is_baseline:
-                w_idx = edges['prev_weather_now_idxs'] if 'prev_weather_now_idxs' in edges else (edges['weather_idxs'] if 'weather_idxs' in edges else edges['weather_now_idxs'])
-                t_idx = edges['prev_time_idxs'] if 'prev_time_idxs' in edges else edges['time_idxs']
-                e_r = (t_emb[t_idx] if self.use_time else 0) + (w_now_emb[w_idx] if self.use_weather else 0)
-            else:
-                s_emb = self.season_embedding.weight if self.use_season else None
-                d_emb = self.day_weather_embedding.weight
-                m_emb = self.month_weather_embedding.weight
-                
-                # Use previous context for translational calculation
-                e_now = w_now_emb[edges['prev_weather_now_idxs']] if 'prev_weather_now_idxs' in edges else w_now_emb[edges['weather_now_idxs']]
-                if not self.use_weather: e_now = torch.zeros_like(e_now)
-                w_day_seq_idx = edges['prev_weather_day_idxs'] if 'prev_weather_day_idxs' in edges else edges['weather_day_idxs']
-                w_yesterday = d_emb[w_day_seq_idx[:, 0]]
-                w_today = d_emb[w_day_seq_idx[:, 1]]
-                w_tomorrow = d_emb[w_day_seq_idx[:, 2]]
-                
-                concat_day = torch.cat([w_yesterday, w_today, w_tomorrow], dim=1)
-                e_day = torch.matmul(concat_day, self.W_day_agg.weight.t()) + self.b_d
-                
-                e_month_idx = edges['prev_weather_month_idxs'] if 'prev_weather_month_idxs' in edges else edges['weather_month_idxs']
-                e_month = m_emb[e_month_idx]
-                concat_weather = torch.cat([e_now, e_day, e_month], dim=1)
-                e_W = torch.matmul(concat_weather, self.W_weather_agg.weight.t()) + self.b_w
-                
-                t_idx = edges['prev_time_idxs'] if 'prev_time_idxs' in edges else edges['time_idxs']
-                e_t = t_emb[t_idx] if self.use_time else 0
-                if self.use_season and s_emb is not None:
-                    s_idx = edges['prev_season_idxs'] if 'prev_season_idxs' in edges else edges['season_idxs']
-                    e_r = e_t + s_emb[s_idx] + e_W
-                else:
-                    e_r = e_t + e_W
-            
-            e_prev = p_emb[edges['prev_poi_idxs']]
-            e_curr = p_emb[edges['poi_idxs']]
-            diff = e_prev + e_r - e_curr
-            g = torch.sum(diff ** 2, dim=1)
-            s = torch.exp(-g)
-            
-            if self.enhanced_traj_ratio > 0 and self.enhanced_traj_ratio < 1:
-                q = torch.quantile(s, self.enhanced_traj_ratio)
-                mask = s >= q
-                
-                filtered_edges = {}
-                for k, v in edges.items():
-                    if isinstance(v, torch.Tensor):
-                        filtered_edges[k] = v[mask]
-                    else:
-                        filtered_edges[k] = v
-                edges = filtered_edges
 
         if self.is_baseline:
             # Baseline MP: Always run GNN for existing method
@@ -232,27 +189,62 @@ class TWTransNet(nn.Module):
             avg_emb = traj_emb.mean(dim=1)
         return self.activation(self.W_poi_agg(avg_emb))
 
-    def predict(self, user_idx, traj_poi_idx, traj_time_vec, traj_lat, traj_lon, candidate_poi_indices, 
-                cand_lat, cand_lon, current_time, mask=None, p_emb_all=None, enhanced_history=None,
+    def set_transition_neighbors(self, nbr_idx, nbr_mask):
+        """POI遷移グラフ G_T の後続POI表を設定（graph_utils.build_transition_neighbors の出力）"""
+        self.trans_nbr_idx, self.trans_nbr_mask = nbr_idx, nbr_mask
+
+    def enhance_traj_poi(self, traj_poi_idx, e_r, p_all):
+        """
+        CAAI 4.1節 Eq(3) + 4.3節 Eq(8): 強化軌跡グラフ
+          1. 軌跡上の各POI l_i について、G_T 上の遷移先候補 l から
+             s(l_i, r_i, l) = exp(-||e_li + e_ri - e_l||^2) が大きい top-K を近傍 N(l_i) とする
+             （r_i はその訪問時の時間・気象（・季節）文脈）
+          2. e_li = σ(1/K Σ_{l∈N(l_i)} W1 e_l)
+        遷移先を持たないPOI（パディング含む）は元の埋め込みをそのまま使う。
+        """
+        nbr_idx = self.trans_nbr_idx[traj_poi_idx]    # [B, L, D]
+        nbr_mask = self.trans_nbr_mask[traj_poi_idx]  # [B, L, D]
+        k = min(self.enhanced_traj_k, nbr_idx.size(-1))
+
+        # 近傍選択（離散選択なので勾配は不要）: g が小さい = s が大きい
+        with torch.no_grad():
+            query = p_all[traj_poi_idx] + e_r                                  # [B, L, d]
+            g = ((query.unsqueeze(2) - p_all[nbr_idx]) ** 2).sum(-1)           # [B, L, D]
+            g = g.masked_fill(~nbr_mask, float('inf'))
+            top = g.topk(k, dim=-1, largest=False).indices                     # [B, L, K]
+            sel_idx = nbr_idx.gather(-1, top)
+            sel_mask = nbr_mask.gather(-1, top).unsqueeze(-1).float()          # [B, L, K, 1]
+
+        sel_emb = self.W_enh(p_all[sel_idx]) * sel_mask                        # [B, L, K, d]
+        cnt = sel_mask.sum(2)                                                  # [B, L, 1]
+        agg = self.activation(sel_emb.sum(2) / cnt.clamp(min=1))
+        return torch.where(cnt > 0, agg, p_all[traj_poi_idx])
+
+    def predict(self, user_idx, traj_poi_idx, traj_time_vec, traj_lat, traj_lon, candidate_poi_indices,
+                cand_lat, cand_lon, traj_abs_time, target_abs_time, mask=None, p_emb_all=None, enhanced_history=None,
                 traj_w_now=None, traj_w_day=None, traj_w_month=None, traj_season=None,
                 u_emb_all=None, t_emb_all=None, w_emb_all=None,
                 s_emb_all=None, d_emb_all=None, m_emb_all=None):
-        
+        """
+        traj_time_vec: 時刻(0-24h)。タイムカテゴリ(24段階)の埋め込みにのみ使用
+        traj_abs_time / target_abs_time: 絶対時間[h]。近接嗜好の d_t にのみ使用
+        """
         # 1. Prepare Base Embeddings (GNN-refined if provided)
         u_emb = (u_emb_all[user_idx] if u_emb_all is not None else self.user_embedding(user_idx)).unsqueeze(1) # [batch, 1, dim]
-        
+        p_all = p_emb_all if p_emb_all is not None else self.poi_embedding.weight
+
         # 2. Build Trajectory Check-in Representation (Sum of all modalities)
-        p_traj = p_emb_all[traj_poi_idx] if p_emb_all is not None else self.poi_embedding(traj_poi_idx)
+        p_traj = p_all[traj_poi_idx]
         t_traj = t_emb_all[traj_time_vec.long()] if t_emb_all is not None else self.time_embedding(traj_time_vec.long())
         if not self.use_time: t_traj = 0
-        
+
         if self.is_baseline:
-            # Baseline: c_i = e_u + e_p + e_t + e_w
+            # Baseline: c_i = e_u + e_p + e_t + e_w   (e_r = e_t + e_w)
             if traj_w_now is None or not self.use_weather: w_traj = 0
             else: w_traj = w_emb_all[traj_w_now] if w_emb_all is not None else self.weather_now_embedding(traj_w_now)
-            c_i = u_emb + p_traj + t_traj + w_traj
+            e_r = t_traj + w_traj
         else:
-            # Proposed: c_i = e_u + e_p + e_t + e_s + e_W
+            # Proposed: c_i = e_u + e_p + e_t + e_s + e_W   (e_r = e_t + e_s + e_W)
             e_now = w_emb_all[traj_w_now] if w_emb_all is not None else self.weather_now_embedding(traj_w_now)
             if not self.use_weather: e_now = torch.zeros_like(e_now)
             
@@ -272,44 +264,37 @@ class TWTransNet(nn.Module):
             
             if self.use_season:
                 e_s = s_emb_all[traj_season] if s_emb_all is not None else self.season_embedding(traj_season)
-                c_i = u_emb + p_traj + t_traj + e_s + e_W
+                e_r = t_traj + e_s + e_W
             else:
-                c_i = u_emb + p_traj + t_traj + e_W
-        
-        # 3. SP-Attention to get History Representation
-        history_rep = self.st_attention(c_i, traj_time_vec, traj_lat, traj_lon, mask=mask)
+                e_r = t_traj + e_W
+
+        # 2.5 強化軌跡グラフ（CAAI Eq 3, 8）: 軌跡上のPOI表現を文脈付き遷移近傍の集約で置き換える
+        if self.use_enhanced_traj:
+            p_traj = self.enhance_traj_poi(traj_poi_idx, e_r, p_all)
+        c_i = u_emb + p_traj + e_r
+
+        # 3. SP-Attention to get History Representation (CAAI Eq 9-12, 近接嗜好は減算)
+        history_rep = self.st_attention(c_i, traj_abs_time, traj_lat, traj_lon, mask=mask)
         if enhanced_history is not None and not self.skip_poi_agg:
             history_rep = history_rep + enhanced_history.unsqueeze(1)
-            
+
         # 4. Build Candidate Representation (Q: POI Embedding Only as per paper)
-        p_cand = p_emb_all[candidate_poi_indices] if p_emb_all is not None else self.poi_embedding(candidate_poi_indices)
-        
-        # 5. Score Calculation (Dot Product between POI Q and Contextualized History)
-        # history_rep: [batch, seq, dim], p_cand: [batch, num_cands, dim]
-        # Result: [batch, num_cands, seq]
+        p_cand = p_all[candidate_poi_indices]
+
+        # 5. 予測層: p_l = 1/|有効位置| Σ_j m_j W2_j (q_l·k_j/√d - w_s·log(1+d_s(l, l_j)))
+        # history_rep(K): [batch, seq, dim], p_cand(Q): [batch, num_cands, dim] -> [batch, num_cands, seq]
         raw_scores = torch.matmul(p_cand, history_rep.transpose(1, 2)) / (self.embed_dim ** 0.5)
-        
-        # 6. Add Distance Biases (Apply as penalties with log scaling)
-        t_target = current_time.unsqueeze(1).unsqueeze(2) # [batch, 1, 1]
-        t_hist = traj_time_vec.unsqueeze(1) # [batch, 1, seq]
-        d_t = torch.abs(t_target - t_hist) # [batch, 1, seq]
-        
+
+        # 空間的近接: 候補POIと各履歴POIの距離。
+        # 時間間隔（正解時刻 - 履歴時刻）は候補POIによらず同じ値で、加算型では順位に影響しないため用いない
+        # （target_abs_time は互換のため引数に残している）
         c_lat, c_lon = cand_lat.unsqueeze(2), cand_lon.unsqueeze(2) # [batch, num_cands, 1]
         h_lat, h_lon = traj_lat.unsqueeze(1), traj_lon.unsqueeze(1) # [batch, 1, seq]
         d_s = self.st_attention.tensor_haversine(c_lat, c_lon, h_lat, h_lon) # [batch, num_cands, seq]
-        
-        d_s_log = torch.log(d_s + 1.0)
-        d_t_log = torch.log(d_t + 1.0)
-        
-        # Final scores: Subtract penalties using st_attention's learned weights, then average across history
-        # (batch, num_cands, seq) -> (batch, num_cands)
-        penalized_scores = raw_scores - (self.st_attention.w_s * d_s_log) - (self.st_attention.w_t * d_t_log)
-        
-        if mask is not None:
-            mask_float = mask.unsqueeze(1).float() # [batch, 1, seq]
-            masked_scores = penalized_scores * mask_float
-            scores = masked_scores.sum(dim=2) / (mask_float.sum(dim=2) + 1e-9)
-        else:
-            scores = penalized_scores.mean(dim=2)
-            
+        logits = raw_scores - self.st_attention.w_s * self.st_attention.spatial_feature(d_s)
+
+        # 系列方向の集約: softmax なしの学習重み W2（STAN 公開実装と同様）。
+        # 有効位置数で割るので、系列長によらずスコアのスケールが揃う
+        m = mask.unsqueeze(1).float() if mask is not None else torch.ones_like(logits[:, :1, :])  # [batch, 1, seq]
+        scores = (logits * self.W2 * m).sum(-1) / m.sum(-1)   # [batch, num_cands]
         return scores
