@@ -182,43 +182,92 @@ class UserGraphLayer(nn.Module):
         return avg_emb
 
 
+def inv_softplus(y):
+    """softplus(x) = y となる x（正値パラメータの初期化用）"""
+    return math.log(math.expm1(y))
+
+
 class SpatialTemporalSelfAttention(nn.Module):
     """
-    Self-Attention with Spatial and Temporal distance bias.
+    Self-Attention with Spatial and Temporal distance penalty.
+        score_ij = Q_i K_j^T / sqrt(d) - w_s * f(d_s(i,j)) - w_t * f(d_t(i,j))
+
+    dist_norm:
+      'legacy' : f(d) = log(1+d)（単位は km / h のまま、w は制約なし）
+      'log'    : f(d) = min( log(1+d) / log(1+D), 1 ) ∈ [0,1]、w = softplus(θ) > 0
+                 D は学習データの軌跡内距離・時間差のパーセンタイル（set_dist_scale で設定）
     """
-    def __init__(self, embed_dim, dropout=0.1):
+    def __init__(self, embed_dim, dropout=0.1, dist_norm='legacy'):
         super(SpatialTemporalSelfAttention, self).__init__()
+        assert dist_norm in ('legacy', 'log')
         self.embed_dim = embed_dim
+        self.dist_norm = dist_norm
         self.W_Q = nn.Linear(embed_dim, embed_dim)
         self.W_K = nn.Linear(embed_dim, embed_dim)
         self.W_V = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.softmax = nn.Softmax(dim=-1)
-        
-        self.w_s = nn.Parameter(torch.tensor(1.0))
-        self.w_t = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, trajectory_emb, time_seq, lat_seq, lon_seq, mask=None):
+        # 初期値はどちらも w = 1.0（log では softplus(θ) = 1.0 となる θ）
+        init = 1.0 if dist_norm == 'legacy' else inv_softplus(1.0)
+        self.w_s_raw = nn.Parameter(torch.tensor(init))
+        self.w_t_raw = nn.Parameter(torch.tensor(init))
+        if dist_norm == 'log':
+            self.register_buffer('d_s_max', torch.tensor(1.0))
+            self.register_buffer('d_t_max', torch.tensor(1.0))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # 旧チェックポイント（パラメータ名 w_s / w_t）との互換
+        for name in ('w_s', 'w_t'):
+            if prefix + name in state_dict and prefix + name + '_raw' not in state_dict:
+                state_dict[prefix + name + '_raw'] = state_dict.pop(prefix + name)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @property
+    def w_s(self):
+        return self.w_s_raw if self.dist_norm == 'legacy' else F.softplus(self.w_s_raw)
+
+    @property
+    def w_t(self):
+        return self.w_t_raw if self.dist_norm == 'legacy' else F.softplus(self.w_t_raw)
+
+    def set_dist_scale(self, d_s_max, d_t_max):
+        if self.dist_norm == 'legacy': return
+        self.d_s_max.fill_(float(d_s_max)); self.d_t_max.fill_(float(d_t_max))
+
+    def _penalty_feature(self, d, d_max):
+        if self.dist_norm == 'legacy':
+            return torch.log(d + 1.0)
+        return (torch.log1p(d) / torch.log1p(d_max)).clamp(max=1.0)
+
+    def spatial_feature(self, d_s):
+        """空間距離 [km] → ペナルティ用の特徴量 f(d_s)"""
+        return self._penalty_feature(d_s, getattr(self, 'd_s_max', None))
+
+    def temporal_feature(self, d_t):
+        """時間間隔 [h] → ペナルティ用の特徴量 f(d_t)"""
+        return self._penalty_feature(d_t, getattr(self, 'd_t_max', None))
+
+    def forward(self, trajectory_emb, abs_time_seq, lat_seq, lon_seq, mask=None):
+        """abs_time_seq: 絶対時間 [h]（時刻カテゴリではない）"""
         Q = self.W_Q(trajectory_emb)
         K = self.W_K(trajectory_emb)
         V = self.W_V(trajectory_emb)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.embed_dim)
 
-        # Time distance: |t_j - t_i|
-        t_i = time_seq.unsqueeze(2)
-        t_j = time_seq.unsqueeze(1)
+        # Time interval [h]: |t_j - t_i|
+        t_i = abs_time_seq.unsqueeze(2)
+        t_j = abs_time_seq.unsqueeze(1)
         d_t = torch.abs(t_j - t_i).float()
 
-        # Spatial distance: Haversine
+        # Spatial distance: Haversine [km]
         lat_i, lon_i = lat_seq.unsqueeze(2), lon_seq.unsqueeze(2)
         lat_j, lon_j = lat_seq.unsqueeze(1), lon_seq.unsqueeze(1)
         d_s = self.tensor_haversine(lat_i, lon_i, lat_j, lon_j)
 
-        d_s_log = torch.log(d_s + 1.0)
-        d_t_log = torch.log(d_t + 1.0)
-
-        scores = scores - (self.w_s * d_s_log) - (self.w_t * d_t_log) #時空間的な距離（$d_s, d_t$）が大きいほどアテンション（重み）は小さくなるべき
+        # 時空間的な距離が大きいほどアテンション（重み）は小さくなる
+        scores = scores - self.w_s * self.spatial_feature(d_s) - self.w_t * self.temporal_feature(d_t)
 
         if mask is not None:
             mask = mask.unsqueeze(1)
