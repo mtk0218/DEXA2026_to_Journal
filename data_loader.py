@@ -1,6 +1,16 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+from datetime import datetime
+
+_EPOCH = datetime(1970, 1, 1)
+
+def to_abs_hours(dt):
+    """datetime を絶対時間 [h] に変換する（近接嗜好 d_t 用）。
+    チェックインのタプルは末尾にこの値を持つ: (..., abs_hours)"""
+    if dt.tzinfo is not None:
+        return dt.timestamp() / 3600.0
+    return (dt - _EPOCH).total_seconds() / 3600.0
 
 def get_session_groups(traj_len, sids=None):
     """traj 上のインデックスをセッションごとにまとめる（sids が None ならユーザ全体で1セッション）"""
@@ -112,8 +122,12 @@ class CheckinDataset(Dataset):
         now_weathers = [x[2] for x in input_seq]
         lats         = [x[3] for x in input_seq]
         lons         = [x[4] for x in input_seq]
+        # 絶対時間 [h]（タプル末尾）。float32 の精度落ちを避けるため入力系列先頭からの相対値にする
+        base_abs     = input_seq[0][-1]
+        abs_times    = [x[-1] - base_abs for x in input_seq]
+        target_abs   = target[-1] - base_abs
 
-        has_full = len(input_seq[0]) >= 10
+        has_full = len(input_seq[0]) >= 11
         if has_full:
             yests   = [x[5] for x in input_seq]
             todays  = [x[6] for x in input_seq]
@@ -129,6 +143,7 @@ class CheckinDataset(Dataset):
             pad = self.seq_len - curr_len
             pois         = [0]   * pad + pois
             times        = [0.0] * pad + times
+            abs_times    = [0.0] * pad + abs_times
             now_weathers = [0]   * pad + now_weathers
             lats         = [0.0] * pad + lats
             lons         = [0.0] * pad + lons
@@ -142,6 +157,7 @@ class CheckinDataset(Dataset):
             offset = curr_len - self.seq_len
             pois         = pois[offset:]
             times        = times[offset:]
+            abs_times    = abs_times[offset:]
             now_weathers = now_weathers[offset:]
             lats         = lats[offset:]
             lons         = lons[offset:]
@@ -166,7 +182,8 @@ class CheckinDataset(Dataset):
         return {
             'user_id':                  torch.tensor(user_id,       dtype=torch.long),
             'traj_poi':                 torch.tensor(pois,          dtype=torch.long),
-            'traj_time':                torch.tensor(times,         dtype=torch.float),
+            'traj_time':                torch.tensor(times,         dtype=torch.float),  # 時刻(0-24h): タイムカテゴリ用
+            'traj_abs_time':            torch.tensor(abs_times,     dtype=torch.float),  # 絶対時間[h]: 近接嗜好 d_t 用
             'traj_now_weather':         torch.tensor(now_weathers,  dtype=torch.long),
             'traj_lat':                 torch.tensor(lats,          dtype=torch.float),
             'traj_lon':                 torch.tensor(lons,          dtype=torch.float),
@@ -180,6 +197,7 @@ class CheckinDataset(Dataset):
             'head_poi':                 torch.tensor(head_poi,      dtype=torch.long),
             'target_poi':               torch.tensor(target_poi,    dtype=torch.long),
             'target_time':              torch.tensor(target_time,   dtype=torch.float),
+            'target_abs_time':          torch.tensor(target_abs,    dtype=torch.float),
             'target_now_weather':       torch.tensor(target_now_w,  dtype=torch.long),
             'target_lat':               torch.tensor(target_lat,    dtype=torch.float),
             'target_lon':               torch.tensor(target_lon,    dtype=torch.float),
